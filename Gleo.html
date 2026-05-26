@@ -1,0 +1,1199 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GLEO</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #f4f4f8; display: flex; align-items: center; justify-content: center;
+         min-height: 100vh; font-family: 'Courier New', monospace; }
+  canvas { display: block; border: 1px solid #dde; cursor: default; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const VW = 720, VH = 480;
+canvas.width = VW * 2; canvas.height = VH * 2; // 2× resolution, all coords stay in 720×480
+
+// ── Input ─────────────────────────────────────────────────────
+const keys  = {};
+const mouse = { x: 0, y: 0 };
+
+let menuSelected = 0; // 0 = START, 1 = DEBUG
+
+window.addEventListener('keydown', e => {
+  keys[e.key] = true;
+  if ([' ','ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Enter'].includes(e.key)) e.preventDefault();
+  if (e.key === 'Escape') returnToMenu();
+  if (gameState === 'levelclear' && clearTimer > 120 && clearOutTimer < 0) {
+    if ((e.key === ' ' && !spaceLockedOnClear) || e.key === 'Enter') { initLevel(lvlIdx + 1); clearOutTimer = 0; }
+  }
+  if (gameState === 'complete' && clearTimer > 120 && !saveRendering) {
+    if ((e.key === ' ' && !spaceLockedOnClear) || e.key === 'Enter') playAgainFromComplete();
+  }
+  if (gameState === 'menu') {
+    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
+      menuSelected = menuSelected === 0 ? 1 : 0;
+    }
+    if (e.key === ' ' || e.key === 'Enter') {
+      if (menuSelected === 0) { startAudio(); initLevel(0); }
+      else                    { startAudio(); initDebugLevel(); }
+    }
+  }
+});
+window.addEventListener('keyup', e => {
+  keys[e.key] = false;
+  if (e.key === ' ') spaceLockedOnClear = false;
+});
+canvas.addEventListener('mousemove', e => {
+  const r = canvas.getBoundingClientRect();
+  mouse.x = (e.clientX - r.left) / 2;
+  mouse.y = (e.clientY - r.top)  / 2;
+  canvas.style.cursor = (gameState === 'menu' && hitBtn(mouse.x, mouse.y)) ? 'pointer' : 'default';
+});
+canvas.addEventListener('click', e => {
+  const r  = canvas.getBoundingClientRect();
+  const mx = (e.clientX - r.left) / 2, my = (e.clientY - r.top) / 2;
+  if (gameState === 'menu') {
+    const b = hitBtn(mx, my);
+    if (b === 'start') { startAudio(); resetAudioState(); pieceMode = false; initLevel(0); }
+    if (b === 'debug') { startAudio(); initDebugLevel(); }
+  }
+  if (gameState === 'levelclear' && clearTimer > 120 && clearOutTimer < 0) {
+    const bx = VW/2 - 60, by = VH/2 + 18, bw = 120, bh = 36;
+    if (mx >= bx && mx <= bx+bw && my >= by && my <= by+bh) {
+      initLevel(lvlIdx + 1);
+      clearOutTimer = 0;
+    }
+  }
+  if (gameState === 'complete' && clearTimer > 120 && !saveRendering) {
+    const cx = VW/2, cy = VH/2;
+    if (mx >= cx-140 && mx <= cx-10  && my >= cy+10 && my <= cy+46) saveAudio();
+    if (mx >= cx+10  && mx <= cx+140 && my >= cy+10 && my <= cy+46) playAgainFromComplete();
+  }
+});
+// Start BGM on any first interaction so menu music plays immediately
+['pointerdown','keydown'].forEach(evt =>
+  document.addEventListener(evt, () => startAudio(), { once: true })
+);
+
+// ── Constants ─────────────────────────────────────────────────
+const PLAYER_R       = 54;
+const PLAYER_MAX_SPD = 3.0;
+const PLAYER_ACCEL   = 0.018;
+const PLAYER_FRIC    = 0.982;
+const SPACE_FRAMES   = 240;     // 4 s @ 60 fps
+const ATTRACT_RANGE  = PLAYER_R * 6;  // 3× player diameter
+const ATTRACT_FORCE  = 0.024;  // reduced 70%
+const ATTRACT_MAX_V  = 2.0;
+const PUSH_FRAMES    = 15;            // 0.25 s equivalent
+const BASE_GAIN      = 0.80;
+const PREVIEW_GAIN   = 0.8;
+const CAPTURE_GAIN   = 0.8;
+
+// 4 levels: 0=tutorial  1=chapter1  2=chapter2  3=final
+
+// ── Audio file lists ──────────────────────────────────────────
+const BASE_FILES = ['audio/Base01.mp3', 'audio/Base02.mp3', 'audio/Base03.mp3'];
+const ORB_FILES  = [
+  'audio/Gleo.mp3',
+  'audio/Gleo_1.mp3',  'audio/Gleo_2.mp3',  'audio/Gleo_3.mp3',  'audio/Gleo_4.mp3',
+  'audio/Gleo_5.mp3',  'audio/Gleo_6.mp3',  'audio/Gleo_7.mp3',  'audio/Gleo_8.mp3',
+  'audio/Gleo_9.mp3',  'audio/Gleo_10.mp3', 'audio/Gleo_11.mp3', 'audio/Gleo_12.mp3',
+  'audio/Gleo_13.mp3',
+];
+const ALL_FILES = [...BASE_FILES, ...ORB_FILES];
+
+// ── Audio system ──────────────────────────────────────────────
+// All 17 <audio> elements — created at page load, works with file://
+const audioEls = {};
+ALL_FILES.forEach(name => {
+  const a    = new Audio(name);
+  a.loop     = true;
+  a.preload  = 'auto';
+  a.volume   = 0;
+  audioEls[name] = a;
+});
+
+// Loading progress
+let loadedCount = 0;
+ALL_FILES.forEach(name => {
+  const a = audioEls[name];
+  const bump = () => { loadedCount++; };
+  if (a.readyState >= 3) { loadedCount++; }
+  else {
+    a.addEventListener('canplaythrough', bump, { once: true });
+    a.addEventListener('error',          bump, { once: true }); // count errors so we don't stall
+  }
+});
+
+// Per-orb-sound state (indexed by ORB_FILES index 0–13)
+const previewCounts = new Array(ORB_FILES.length).fill(0); // orbs currently in proximity
+const orbCaptures   = new Set();   // permanently captured soundIdx values
+// Base target gains
+const baseTargets   = [BASE_GAIN, 0, 0];
+
+let audioStarted = false;
+
+function startAudio() {
+  if (audioStarted) return;
+  audioStarted = true;
+  ALL_FILES.forEach(name => audioEls[name].play().catch(() => {}));
+  audioEls['audio/Base01.mp3'].volume = BASE_GAIN;
+  initNoiseCtx();
+}
+
+// Called every frame — smooth volume lerp for all tracks
+function updateVolumes() {
+  if (!audioStarted || saveRendering) return;
+  const LERP_SLOW = 0.025;  // base layer fade (2 bars ≈ 4.8 s)
+  const LERP_FAST = 0.055;  // orb preview fade
+
+  for (let i = 0; i < 3; i++) {
+    const a = audioEls[BASE_FILES[i]];
+    a.volume = clamp(a.volume + (baseTargets[i] - a.volume) * LERP_SLOW, 0, 1);
+  }
+  for (let i = 0; i < ORB_FILES.length; i++) {
+    const target = orbCaptures.has(i) ? CAPTURE_GAIN * levelVolScale
+                 : previewCounts[i] > 0 ? PREVIEW_GAIN * levelVolScale
+                 : 0;
+    const a = audioEls[ORB_FILES[i]];
+    a.volume = clamp(a.volume + (target - a.volume) * LERP_FAST, 0, 1);
+  }
+}
+
+function unlockBase(idx) { baseTargets[idx] = BASE_GAIN; }
+
+function resetAudioState() {
+  baseTargets[1] = 0;
+  baseTargets[2] = 0;
+  orbCaptures.clear();
+  previewCounts.fill(0);
+  level1OrbCaptures = new Set();
+  greatMelodyCaptured = false;
+  // Stop and discard persistent noise nodes
+  for (const n of capturedNoise) {
+    if (noiseCtx) {
+      const now = noiseCtx.currentTime;
+      n.gain.gain.cancelScheduledValues(now);
+      n.gain.gain.setValueAtTime(n.gain.gain.value, now);
+      n.gain.gain.linearRampToValueAtTime(0, now + 0.3);
+      setTimeout(() => n.srcs.forEach(s => { try { s.stop(); } catch(e){} }), 400);
+    }
+  }
+  capturedNoise.length = 0;
+  stopAllNoisePreviews();
+}
+
+function stopAllPreviews() { previewCounts.fill(0); stopAllNoisePreviews(); }
+
+async function saveAudio() {
+  if (saveRendering) return;
+  saveRendering = true;
+  saveStartTime = performance.now();
+
+  const SECTION_MS = 8 * 2400;
+  const TOTAL_MS   = SECTION_MS * 4;
+  const lvl1Orbs   = [...level1OrbCaptures].filter(i => i >= 0);
+  const lvl3Orbs   = [...orbCaptures].filter(i => i >= 0 && !level1OrbCaptures.has(i));
+
+  const sections = [
+    { bases: new Set([0]),     orbs: new Set(lvl1Orbs) },
+    { bases: new Set([0,1]),   orbs: new Set(lvl1Orbs) },
+    { bases: new Set([0,1,2]), orbs: new Set([...lvl1Orbs, ...lvl3Orbs.slice(0, Math.ceil(lvl3Orbs.length / 2))]) },
+    { bases: new Set([0,1,2]), orbs: new Set([...lvl1Orbs, ...lvl3Orbs]) },
+  ];
+
+  const savedVols = {};
+  ALL_FILES.forEach(n => { savedVols[n] = audioEls[n].volume; });
+
+  const applySection = sec => {
+    BASE_FILES.forEach((n, i) => { audioEls[n].volume = sec.bases.has(i) ? BASE_GAIN    : 0; });
+    ORB_FILES.forEach( (n, i) => { audioEls[n].volume = sec.orbs.has(i)  ? CAPTURE_GAIN : 0; });
+  };
+
+  let recAc;
+  try {
+    recAc = new AudioContext();
+    const recDest = recAc.createMediaStreamDestination();
+
+    for (const name of ALL_FILES) {
+      const el  = audioEls[name];
+      const cap = el.captureStream || el.mozCaptureStream;
+      if (!cap) throw new Error('captureStream not supported in this browser.');
+      recAc.createMediaStreamSource(cap.call(el)).connect(recDest);
+    }
+
+    const chunks = [];
+    const mime = ['audio/webm;codecs=opus','audio/webm','audio/ogg']
+                   .find(t => MediaRecorder.isTypeSupported(t)) || '';
+    const rec = new MediaRecorder(recDest.stream, mime ? { mimeType: mime } : {});
+    rec.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
+    rec.onstop = () => {
+      const blob = new Blob(chunks, { type: mime || 'audio/webm' });
+      const url  = URL.createObjectURL(blob);
+      const a    = Object.assign(document.createElement('a'), { href: url, download: 'gleo.webm' });
+      document.body.appendChild(a); a.click(); document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      ALL_FILES.forEach(n => { audioEls[n].volume = savedVols[n]; });
+      recAc.close();
+      saveRendering = false;
+    };
+
+    applySection(sections[0]);
+    rec.start(250);
+    setTimeout(() => applySection(sections[1]), SECTION_MS);
+    setTimeout(() => applySection(sections[2]), SECTION_MS * 2);
+    setTimeout(() => applySection(sections[3]), SECTION_MS * 3);
+    setTimeout(() => rec.stop(),                TOTAL_MS);
+
+  } catch(e) {
+    ALL_FILES.forEach(n => { audioEls[n].volume = savedVols[n]; });
+    if (recAc) recAc.close();
+    alert('Recording failed: ' + e.message);
+    saveRendering = false;
+  }
+}
+
+function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+// ── Game state ─────────────────────────────────────────────────
+let lvlIdx  = 0;
+let WORLD_W = 720, WORLD_H = 480;
+let player, orbs;
+let cam        = { x: 0, y: 0, vx: 0, vy: 0 };
+let spaceTimer       = 0;
+let spaceAttractFrames = 0;
+let prevSpaceHeld    = false;
+let levelVolScale = 1.0;  // per-level melody volume multiplier
+let gameState     = 'loading'; // 'loading'|'menu'|'playing'|'levelclear'|'debug'
+let clearTimer    = 0;
+let clearOutTimer = -1;  // -1 = inactive; ≥0 = exit animation running
+let tutorialFirstTouch  = false;
+let tutorialTimer       = 0;
+let spaceLockedOnClear  = false;
+let level1OrbCaptures   = new Set();
+let greatMelodyCaptured = false;
+let pieceMode           = false;
+let saveRendering       = false;
+let saveStartTime       = 0;
+let tick          = 0;
+
+function rnd(a, b) { return a + Math.random() * (b - a); }
+
+function hslToRgb(h, s, l) {
+  s /= 100; l /= 100;
+  const a = s * Math.min(l, 1 - l);
+  const f = n => Math.round((l - a * Math.max(Math.min((n + h/30) % 12 - 3, 9 - (n + h/30) % 12, 1), -1)) * 255);
+  return `${f(0)},${f(8)},${f(4)}`;
+}
+
+// ── Bubble background (depth / parallax) ──────────────────────
+// Three layers: far (small, faint, slow), mid, near (large, more visible, fast)
+const BUBBLE_DEFS = [
+  { n: 32, rMin: 4,  rMax: 18, aMin: 0.04, aMax: 0.08, depth: 0.12, spd: 0.05 },
+  { n: 19, rMin: 14, rMax: 40, aMin: 0.05, aMax: 0.09, depth: 0.40, spd: 0.09 },
+  { n:  9, rMin: 32, rMax: 76, aMin: 0.03, aMax: 0.07, depth: 0.75, spd: 0.15 },
+];
+const BUBBLES = [];
+BUBBLE_DEFS.forEach(d => {
+  for (let i = 0; i < d.n; i++) {
+    const angle = Math.random() * Math.PI * 2;
+    const spd   = d.spd * (0.5 + Math.random() * 0.8);
+    BUBBLES.push({
+      ax: Math.random() * VW,
+      ay: Math.random() * VH,
+      r:  d.rMin + Math.random() * (d.rMax - d.rMin),
+      a:  d.aMin + Math.random() * (d.aMax - d.aMin),
+      depth: d.depth,
+      dx: Math.cos(angle) * spd,
+      dy: Math.sin(angle) * spd,
+    });
+  }
+});
+
+function updateBubbles() {
+  for (const b of BUBBLES) {
+    b.ax += b.dx;
+    b.ay += b.dy;
+    // Wrap within [0, VW) × [0, VH)
+    if (b.ax < -b.r * 2) b.ax += VW + b.r * 4;
+    if (b.ax > VW + b.r * 2) b.ax -= VW + b.r * 4;
+    if (b.ay < -b.r * 2) b.ay += VH + b.r * 4;
+    if (b.ay > VH + b.r * 2) b.ay -= VH + b.r * 4;
+  }
+}
+
+function drawBubbles() {
+  for (const b of BUBBLES) {
+    // Parallax offset: far bubbles barely move, near bubbles nearly follow world
+    const sx0 = ((b.ax - cam.x * b.depth) % VW + VW) % VW;
+    const sy0 = ((b.ay - cam.y * b.depth) % VH + VH) % VH;
+    // Tile one extra copy to cover wrap seams
+    for (const tx of [0, VW]) {
+      for (const ty of [0, VH]) {
+        const sx = sx0 - tx, sy = sy0 - ty;
+        if (sx + b.r < -4 || sx - b.r > VW + 4) continue;
+        if (sy + b.r < -4 || sy - b.r > VH + 4) continue;
+        // Body
+        ctx.beginPath();
+        ctx.arc(sx, sy, b.r, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(175,188,228,${b.a})`;
+        ctx.fill();
+        // Rim
+        ctx.strokeStyle = `rgba(175,188,228,${b.a * 0.7})`;
+        ctx.lineWidth = 0.5;
+        ctx.stroke();
+        // Specular highlight on larger bubbles
+        if (b.r > 9) {
+          ctx.beginPath();
+          ctx.arc(sx - b.r * 0.28, sy - b.r * 0.28, b.r * 0.28, 0, Math.PI * 2);
+          ctx.fillStyle = `rgba(255,255,255,${b.a * 0.7})`;
+          ctx.fill();
+        }
+      }
+    }
+  }
+}
+
+// ── Noise system (Web Audio — works on file:// unlike fetch) ──
+let noiseCtx    = null;
+let noiseMaster = null;
+const noisePreviewMap  = new Map(); // orb → { srcs, gain }
+const capturedNoise    = [];        // { srcs, gain } — persistent cross-level
+const noiseBufCache    = {};        // 'white'|'pink' → AudioBuffer
+
+function initNoiseCtx() {
+  if (noiseCtx) return;
+  noiseCtx    = new (window.AudioContext || window.webkitAudioContext)();
+  noiseMaster = noiseCtx.createGain();
+  noiseMaster.gain.value = 0.38;
+  noiseMaster.connect(noiseCtx.destination);
+}
+
+function getNoiseBuf(kind) {
+  if (noiseBufCache[kind]) return noiseBufCache[kind];
+  const len = noiseCtx.sampleRate * 4;
+  const buf = noiseCtx.createBuffer(1, len, noiseCtx.sampleRate);
+  const d   = buf.getChannelData(0);
+  if (kind === 'white') {
+    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+  } else {
+    let b0=0,b1=0,b2=0,b3=0,b4=0,b5=0;
+    for (let i = 0; i < len; i++) {
+      const w = Math.random() * 2 - 1;
+      b0=0.99886*b0+w*0.0555179; b1=0.99332*b1+w*0.0750759;
+      b2=0.96900*b2+w*0.1538520; b3=0.86650*b3+w*0.3104856;
+      b4=0.55000*b4+w*0.5329522; b5=-0.7616*b5-w*0.0168980;
+      d[i] = (b0+b1+b2+b3+b4+b5+w*0.5362) / 7;
+    }
+  }
+  noiseBufCache[kind] = buf;
+  return buf;
+}
+
+// 6 distinct noise types: 0=hiss 1=rumble 2=wind 3=drone 4=sub-pulse 5=soft-static
+function buildNoiseChain(noiseType, destGain) {
+  const t = ((noiseType % 6) + 6) % 6;
+  const srcs = [];
+  if (t === 0 || t === 1 || t === 2) {
+    const src = noiseCtx.createBufferSource();
+    src.buffer = getNoiseBuf('white'); src.loop = true;
+    const f = noiseCtx.createBiquadFilter();
+    if (t === 0) { f.type='highpass'; f.frequency.value=3200; f.Q.value=0.5; }
+    if (t === 1) { f.type='lowpass';  f.frequency.value=140;  f.Q.value=0.6; }
+    if (t === 2) { f.type='bandpass'; f.frequency.value=620;  f.Q.value=2.2; }
+    src.connect(f); f.connect(destGain); src.start(); srcs.push(src);
+  } else if (t === 3) {
+    for (const det of [-6, 0, 7]) {
+      const osc = noiseCtx.createOscillator();
+      osc.type='triangle'; osc.frequency.value=130; osc.detune.value=det*8;
+      const lfo=noiseCtx.createOscillator(); lfo.frequency.value=0.25+Math.random()*0.3;
+      const lg=noiseCtx.createGain(); lg.gain.value=6;
+      lfo.connect(lg); lg.connect(osc.frequency);
+      osc.connect(destGain); lfo.start(); osc.start(); srcs.push(osc,lfo);
+    }
+  } else if (t === 4) {
+    const osc=noiseCtx.createOscillator(); osc.type='sine'; osc.frequency.value=42;
+    const lfo=noiseCtx.createOscillator(); lfo.type='sine'; lfo.frequency.value=1.6;
+    const amp=noiseCtx.createGain(); amp.gain.value=0.55;
+    const lg=noiseCtx.createGain(); lg.gain.value=0.4;
+    lfo.connect(lg); lg.connect(amp.gain);
+    osc.connect(amp); amp.connect(destGain); lfo.start(); osc.start(); srcs.push(osc,lfo);
+  } else {
+    const src=noiseCtx.createBufferSource();
+    src.buffer=getNoiseBuf('pink'); src.loop=true;
+    const f=noiseCtx.createBiquadFilter(); f.type='lowpass'; f.frequency.value=480;
+    src.connect(f); f.connect(destGain); src.start(); srcs.push(src);
+  }
+  return srcs;
+}
+
+function startNoisePreview(orb) {
+  if (!noiseCtx || noisePreviewMap.has(orb)) return;
+  const gain = noiseCtx.createGain(); gain.gain.value = 0;
+  gain.connect(noiseMaster);
+  const srcs = buildNoiseChain(orb.noiseType, gain);
+  const now = noiseCtx.currentTime;
+  gain.gain.setValueAtTime(0, now);
+  gain.gain.linearRampToValueAtTime(PREVIEW_GAIN * 0.6, now + 0.4);
+  noisePreviewMap.set(orb, { srcs, gain });
+}
+
+function stopNoisePreview(orb) {
+  const n = noisePreviewMap.get(orb); if (!n || !noiseCtx) return;
+  const now = noiseCtx.currentTime;
+  n.gain.gain.cancelScheduledValues(now);
+  n.gain.gain.setValueAtTime(n.gain.gain.value, now);
+  n.gain.gain.linearRampToValueAtTime(0, now + 0.5);
+  setTimeout(() => n.srcs.forEach(s => { try { s.stop(); } catch(e){} }), 600);
+  noisePreviewMap.delete(orb);
+}
+
+function stopAllNoisePreviews() {
+  for (const [orb] of noisePreviewMap) stopNoisePreview(orb);
+}
+
+function captureNoiseOrb(orb) {
+  if (!noiseCtx) return;
+  const existing = noisePreviewMap.get(orb);
+  const node = existing || (() => {
+    const gain = noiseCtx.createGain(); gain.gain.value = 0;
+    gain.connect(noiseMaster);
+    const srcs = buildNoiseChain(orb.noiseType, gain);
+    return { srcs, gain };
+  })();
+  const now = noiseCtx.currentTime;
+  node.gain.gain.cancelScheduledValues(now);
+  node.gain.gain.setValueAtTime(node.gain.gain.value, now);
+  node.gain.gain.linearRampToValueAtTime(CAPTURE_GAIN * 0.55, now + 1.2);
+  capturedNoise.push(node);
+  noisePreviewMap.delete(orb);
+}
+
+function returnToMenu() {
+  if (gameState === 'playing' || gameState === 'debug' || gameState === 'levelclear' || gameState === 'complete') {
+    stopAllPreviews();
+    baseTargets[0] = BASE_GAIN;
+    gameState = 'menu';
+  }
+}
+
+function playAgainFromComplete() {
+  pieceMode = true; levelVolScale = 1.0;
+  stopAllPreviews();
+  for (let i = 0; i < 3; i++) unlockBase(i);
+  gameState = 'menu';
+}
+
+// ── Level init ────────────────────────────────────────────────
+function initLevel(idx) {
+  lvlIdx = Math.min(idx, 3);
+  levelVolScale = 1.0;
+  spaceTimer = 0; clearTimer = 0; clearOutTimer = -1; tick = 0;
+
+  // Level 0 — Tutorial
+  if (lvlIdx === 0) {
+    WORLD_W = VW; WORLD_H = VH;
+    player = { x: VW / 2 - 150, y: VH / 2, r: PLAYER_R, vx: 0, vy: 0 };
+    cam.x = cam.y = cam.vx = cam.vy = 0;
+    stopAllPreviews();
+    const th = 220, ts = 100, tl = 72;
+    orbs = [{
+      x: VW / 2 + 250, y: VH / 2, r: PLAYER_R / 2,
+      vx: 0, vy: 0, type: 'blue', soundIdx: -1, isTutorial: true,
+      hsl: `hsla(${th},${ts}%,${tl}%,`, rgb: hslToRgb(th, ts, tl),
+      pulse: 0, connected: false, prevConn: false,
+    }];
+    baseTargets[0] = 0; audioEls['audio/Base01.mp3'].volume = 0;
+    tutorialFirstTouch = false; tutorialTimer = 0;
+    levelVolScale = 0.6; gameState = 'playing'; return;
+  }
+
+  // Level 1 — Chapter 1: collect 2 melody orbs
+  if (lvlIdx === 1) {
+    WORLD_W = VW * 2; WORLD_H = VH * 2;
+    player = { x: WORLD_W / 2, y: WORLD_H / 2, r: PLAYER_R, vx: 0, vy: 0 };
+    cam.x = player.x - VW / 2; cam.y = player.y - VH / 2; cam.vx = cam.vy = 0;
+    stopAllPreviews(); orbs = [];
+    for (let i = 0; i < 12; i++) orbs.push(spawnOrb('blue', i % ORB_FILES.length));
+    gameState = 'playing'; return;
+  }
+
+  // Level 2 — Chapter 2: find the Great Melody Orb
+  if (lvlIdx === 2) {
+    WORLD_W = VW * 3; WORLD_H = VH * 3;
+    let px, py, ox, oy;
+    do {
+      px = rnd(200, WORLD_W - 200); py = rnd(200, WORLD_H - 200);
+      ox = rnd(200, WORLD_W - 200); oy = rnd(200, WORLD_H - 200);
+    } while (Math.hypot(px - ox, py - oy) < 800);
+    player = { x: px, y: py, r: PLAYER_R, vx: 0, vy: 0 };
+    cam.x = clamp(px - VW / 2, 0, WORLD_W - VW);
+    cam.y = clamp(py - VH / 2, 0, WORLD_H - VH);
+    cam.vx = cam.vy = 0;
+    stopAllPreviews(); baseTargets[1] = 0;
+    const gh = 180, gs = 80, gl = 55;
+    orbs = [{
+      x: ox, y: oy, r: PLAYER_R / 2, vx: 0, vy: 0,
+      type: 'blue', soundIdx: -2, isGreatMelody: true,
+      hsl: `hsla(${gh},${gs}%,${gl}%,`, rgb: hslToRgb(gh, gs, gl),
+      pulse: 0, connected: false, prevConn: false,
+    }];
+    for (let i = 0; i < 72; i++) orbs.push(spawnOrb('black', i % 6));
+    for (let i = 0; i < 8;  i++) orbs.push(spawnOrb('blue',  i % ORB_FILES.length));
+    gameState = 'playing'; return;
+  }
+
+  // Level 3 — Final chapter
+  WORLD_W = VW * 6; WORLD_H = VH * 6;
+  player = { x: WORLD_W / 2, y: WORLD_H / 2, r: PLAYER_R, vx: 0, vy: 0 };
+  cam.x = player.x - VW / 2; cam.y = player.y - VH / 2; cam.vx = cam.vy = 0;
+  stopAllPreviews(); orbs = [];
+  for (let i = 0; i < 56; i++) orbs.push(spawnOrb('blue',  i % ORB_FILES.length));
+  for (let i = 0; i < 80; i++) orbs.push(spawnOrb('black', i % 6));
+  for (let i = 0; i < 3; i++) unlockBase(i);
+  gameState = 'playing';
+}
+
+// ── Debug level ───────────────────────────────────────────────
+function initDebugLevel() {
+  WORLD_W = VW;
+  WORLD_H = VH;
+
+  player = { x: WORLD_W / 2, y: WORLD_H / 2 + 80, r: PLAYER_R, vx: 0, vy: 0 };
+  cam.x = cam.y = cam.vx = cam.vy = 0;
+
+  stopAllPreviews();
+  orbs = [];
+
+  // 14 orbs in a neat 7 × 2 grid
+  const COLS = 7, ROWS = 2;
+  const padX = 90, padY = 110;
+  const stepX = (WORLD_W - padX * 2) / (COLS - 1);
+  const stepY = 120;
+
+  for (let row = 0; row < ROWS; row++) {
+    for (let col = 0; col < COLS; col++) {
+      const i = row * COLS + col;
+      if (i >= ORB_FILES.length) break;
+      orbs.push({
+        x: padX + col * stepX,
+        y: padY + row * stepY,
+        r: 10, vx: 0, vy: 0,
+        type: 'blue', soundIdx: i,
+        pulse: (i / ORB_FILES.length) * Math.PI * 2,
+        connected: false, prevConn: false,
+      });
+    }
+  }
+
+  spaceTimer = 0;
+  gameState  = 'debug';
+  clearTimer    = 0;
+  clearOutTimer = -1;
+  tick          = 0;
+}
+
+function captureAndEndLevel() {
+  for (const o of orbs) {
+    if (!o.connected) continue;
+    if (o.type === 'blue' && !o.isTutorial && !o.isGreatMelody) orbCaptures.add(o.soundIdx);
+    if (o.type === 'black') captureNoiseOrb(o);
+  }
+  spaceLockedOnClear = !!keys[' '];
+  gameState  = lvlIdx >= 3 ? 'complete' : 'levelclear';
+  clearTimer = 0;
+}
+
+function spawnOrb(type, soundIdx) {
+  const r   = type === 'blue' ? rnd(4.8, 9.6) : rnd(9, 99);
+  const spd = type === 'blue' ? 0.108 : 0;
+  const mg  = r + 20;
+  let x, y;
+  do {
+    x = rnd(mg, WORLD_W - mg);
+    y = rnd(mg, WORLD_H - mg);
+  } while (Math.hypot(x - WORLD_W / 2, y - WORLD_H / 2) < 220);
+  const vx = spd ? (rnd(-spd, spd) || spd * 0.6) : 0;
+  const vy = spd ? (rnd(-spd, spd) || spd * 0.6) : 0;
+  const h  = type === 'blue' ? 185 + Math.random() * 85 : 0;
+  const s  = type === 'blue' ? 22  + Math.random() * 23 : 0;
+  const l  = type === 'blue' ? 55  + Math.random() * 17 : 0;
+  return { x, y, r, vx, vy, type,
+           soundIdx:  type === 'blue'  ? soundIdx : -1,
+           noiseType: type === 'black' ? soundIdx :  0,
+           hsl: `hsla(${h.toFixed(0)},${s.toFixed(0)}%,${l.toFixed(0)}%,`,
+           rgb: type === 'blue' ? hslToRgb(h, s, l) : '28,18,48',
+           pulse: Math.random() * Math.PI * 2,
+           connected: false, prevConn: false };
+}
+
+// ── Physics helpers ───────────────────────────────────────────
+function dist(a, b) { return Math.hypot(a.x - b.x, a.y - b.y); }
+
+function wallBounce(o) {
+  if (!o.vx && !o.vy) return;
+  if (o.x - o.r < 0)       { o.x = o.r;           o.vx =  Math.abs(o.vx); }
+  if (o.x + o.r > WORLD_W) { o.x = WORLD_W - o.r; o.vx = -Math.abs(o.vx); }
+  if (o.y - o.r < 0)       { o.y = o.r;            o.vy =  Math.abs(o.vy); }
+  if (o.y + o.r > WORLD_H) { o.y = WORLD_H - o.r; o.vy = -Math.abs(o.vy); }
+}
+
+function playerBounce() {
+  const p = player;
+  if (p.x - p.r < 0)       { p.x = p.r;           p.vx =  Math.abs(p.vx); }
+  if (p.x + p.r > WORLD_W) { p.x = WORLD_W - p.r; p.vx = -Math.abs(p.vx); }
+  if (p.y - p.r < 0)       { p.y = p.r;            p.vy =  Math.abs(p.vy); }
+  if (p.y + p.r > WORLD_H) { p.y = WORLD_H - p.r; p.vy = -Math.abs(p.vy); }
+}
+
+// ── Update ────────────────────────────────────────────────────
+function update() {
+  updateVolumes();
+  updateBubbles();
+
+  if (gameState === 'loading') {
+    if (loadedCount >= ALL_FILES.length) gameState = 'menu';
+    return;
+  }
+  if (gameState === 'menu') return;
+
+  // Exit overlay counter runs in any state
+  if (clearOutTimer >= 0 && ++clearOutTimer >= 60) clearOutTimer = -1;
+
+  if (gameState === 'levelclear' || gameState === 'complete') {
+    clearTimer++;
+    return;
+  }
+
+  const isDebug = gameState === 'debug';
+
+  // Player movement
+  let ax = 0, ay = 0;
+  if (keys['ArrowLeft']  || keys['a']) ax -= 1;
+  if (keys['ArrowRight'] || keys['d']) ax += 1;
+  if (keys['ArrowUp']    || keys['w']) ay -= 1;
+  if (keys['ArrowDown']  || keys['s']) ay += 1;
+  const al = Math.hypot(ax, ay);
+  if (al > 0) { ax /= al; ay /= al; }
+  const pspd0    = Math.hypot(player.vx, player.vy);
+  const effAccel = PLAYER_ACCEL * Math.max(0, 1 - pspd0 / PLAYER_MAX_SPD);
+  player.vx = (player.vx + ax * effAccel) * PLAYER_FRIC;
+  player.vy = (player.vy + ay * effAccel) * PLAYER_FRIC;
+  const pspd = Math.hypot(player.vx, player.vy);
+  if (pspd > PLAYER_MAX_SPD) {
+    player.vx = player.vx / pspd * PLAYER_MAX_SPD;
+    player.vy = player.vy / pspd * PLAYER_MAX_SPD;
+  }
+  player.x += player.vx; player.y += player.vy;
+  playerBounce();
+
+  // Camera (debug: no scroll needed since world = viewport)
+  if (!isDebug) {
+    const tx = player.x - VW / 2, ty = player.y - VH / 2;
+    cam.vx += (tx - cam.x) * 0.022; cam.vy += (ty - cam.y) * 0.022;
+    cam.vx *= 0.92; cam.vy *= 0.92;
+    cam.x = Math.max(0, Math.min(WORLD_W - VW, cam.x + cam.vx));
+    cam.y = Math.max(0, Math.min(WORLD_H - VH, cam.y + cam.vy));
+  }
+
+  // Orb movement
+  for (const o of orbs) {
+    o.pulse += 0.02;
+    o.x += o.vx; o.y += o.vy;
+    wallBounce(o);
+  }
+
+  // Player proximity drag — melody orbs slow when passing near player
+  for (const o of orbs) {
+    if (o.type !== 'blue' || o.isTutorial || o.isGreatMelody) continue;
+    const d = dist(player, o);
+    const dragR = player.r * 5;
+    if (d < dragR) {
+      const drag = 0.96 + 0.04 * (d / dragR); // 0.96 at closest, 1.0 at edge
+      o.vx *= drag; o.vy *= drag;
+    }
+  }
+
+  // Orb–orb collision (skip in debug — orbs are static)
+  if (!isDebug) {
+    for (let i = 0; i < orbs.length; i++) {
+      for (let j = i + 1; j < orbs.length; j++) {
+        const a = orbs[i], b = orbs[j];
+        if (a.type === 'black' && b.type === 'black') continue;
+        const d = dist(a, b), minD = a.r + b.r;
+        if (d >= minD || d === 0) continue;
+        const nx = (b.x - a.x) / d, ny = (b.y - a.y) / d;
+        if (a.type === 'black') {
+          b.x += nx*(minD-d); b.y += ny*(minD-d); b.vx += nx*0.04; b.vy += ny*0.04;
+        } else if (b.type === 'black') {
+          a.x -= nx*(minD-d); a.y -= ny*(minD-d); a.vx -= nx*0.04; a.vy -= ny*0.04;
+        } else {
+          const ov=(minD-d)/2;
+          a.x-=nx*ov; a.y-=ny*ov; b.x+=nx*ov; b.y+=ny*ov;
+          const dot=(a.vx-b.vx)*nx+(a.vy-b.vy)*ny;
+          a.vx-=dot*nx; a.vy-=dot*ny; b.vx+=dot*nx; b.vy+=dot*ny;
+        }
+      }
+    }
+  }
+
+  // Connection — pure proximity, triggers audio on state change
+  let conn = 0;
+  for (const o of orbs) {
+    o.connected = dist(player, o) < player.r + o.r + 6;
+    if (o.connected) conn++;
+    if (o.isTutorial) {
+      if (o.connected && !tutorialFirstTouch) tutorialFirstTouch = true;
+      baseTargets[0] = o.connected ? BASE_GAIN : 0;
+      o.prevConn = o.connected;
+    } else if (o.isGreatMelody) {
+      baseTargets[1] = o.connected ? BASE_GAIN : 0;
+      o.prevConn = o.connected;
+    } else if (o.connected !== o.prevConn) {
+      if (o.type === 'blue') {
+        const si = o.soundIdx;
+        if (o.connected) previewCounts[si] = (previewCounts[si] || 0) + 1;
+        else             previewCounts[si] = Math.max(0, (previewCounts[si] || 0) - 1);
+      } else {
+        if (o.connected) startNoisePreview(o);
+        else             stopNoisePreview(o);
+      }
+      o.prevConn = o.connected;
+    }
+  }
+  if (tutorialFirstTouch) tutorialTimer++;
+
+  // Space: attract orbs + (hold 3 s while connected → capture)
+  const spaceHeld = !!keys[' '];
+
+  if (spaceHeld) {
+    spaceAttractFrames++;
+    // Pull all orbs within ATTRACT_RANGE toward player
+    for (const o of orbs) {
+      if (o.isTutorial || o.isGreatMelody) continue;
+      const dx = player.x - o.x, dy = player.y - o.y;
+      const d  = Math.hypot(dx, dy) || 1;
+      if (d < ATTRACT_RANGE) {
+        const scale = o.type === 'blue' ? 0.20 : 0.05;
+        const f = ATTRACT_FORCE * scale * (1 - d / ATTRACT_RANGE);
+        o.vx += (dx / d) * f;
+        o.vy += (dy / d) * f;
+        const ov = Math.hypot(o.vx, o.vy);
+        if (ov > ATTRACT_MAX_V) { o.vx = o.vx / ov * ATTRACT_MAX_V; o.vy = o.vy / ov * ATTRACT_MAX_V; }
+      }
+    }
+    // Capture requires meeting the level's connection threshold simultaneously
+    const connMeetsReq = lvlIdx === 1 ? conn >= 2
+                       : lvlIdx === 2 ? orbs.some(o => o.isGreatMelody && o.connected)
+                       : conn > 0;
+    if (connMeetsReq) {
+      spaceTimer++;
+      if (spaceTimer >= SPACE_FRAMES) {
+        if (isDebug) {
+          for (const o of orbs) {
+            if (!o.connected) continue;
+            if (o.type === 'blue')  orbCaptures.add(o.soundIdx);
+            if (o.type === 'black') captureNoiseOrb(o);
+          }
+          spaceTimer = 0;
+        } else if (lvlIdx === 1) {
+          // Chapter 1: capture ALL currently connected blue orbs at once (≥2 guaranteed)
+          for (const o of orbs) {
+            if (!o.connected || o.type !== 'blue') continue;
+            orbCaptures.add(o.soundIdx);
+          }
+          level1OrbCaptures = new Set(orbCaptures);
+          spaceLockedOnClear = !!keys[' '];
+          gameState = 'levelclear'; clearTimer = 0;
+        } else if (lvlIdx === 2) {
+          greatMelodyCaptured = true;
+          baseTargets[1] = BASE_GAIN;
+          spaceLockedOnClear = !!keys[' '];
+          gameState = 'levelclear'; clearTimer = 0;
+        } else {
+          captureAndEndLevel();
+        }
+      }
+    } else {
+      spaceTimer = Math.max(0, spaceTimer - 1.5);
+    }
+  } else {
+    // Just released — gentle outward push
+    if (prevSpaceHeld && spaceAttractFrames > 0) {
+      const strength = Math.min(spaceAttractFrames / PUSH_FRAMES, 1);
+      for (const o of orbs) {
+        if (o.isTutorial || o.isGreatMelody) continue;
+        const dx = o.x - player.x, dy = o.y - player.y;
+        const d  = Math.hypot(dx, dy) || 1;
+        if (d < ATTRACT_RANGE * 1.2) {
+          const scale = o.type === 'blue' ? 0.20 : 0.05;
+          const f = strength * ATTRACT_FORCE * scale * PUSH_FRAMES * (1 - d / (ATTRACT_RANGE * 1.2));
+          o.vx += (dx / d) * f;
+          o.vy += (dy / d) * f;
+        }
+      }
+      spaceAttractFrames = 0;
+    }
+    spaceTimer = Math.max(0, spaceTimer - 1.5);
+  }
+  prevSpaceHeld = spaceHeld;
+
+  tick++;
+}
+
+// ── Draw helpers ──────────────────────────────────────────────
+function glowAt(x, y, r, rgb, a) {
+  const g = ctx.createRadialGradient(x, y, r * 0.2, x, y, r * 2.2);
+  g.addColorStop(0, `rgba(${rgb},${a})`);
+  g.addColorStop(1, 'rgba(255,255,255,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(x, y, r * 2.2, 0, Math.PI * 2); ctx.fill();
+}
+
+// Cheap glow for small orbs — no gradient object per frame
+function glowFlat(x, y, r, rgb, a) {
+  ctx.beginPath();
+  ctx.arc(x, y, r * 2.4, 0, Math.PI * 2);
+  ctx.fillStyle = `rgba(${rgb},${a * 0.4})`;
+  ctx.fill();
+}
+
+// ── Menu buttons ──────────────────────────────────────────────
+const BTNS = {
+  start: { x: VW/2 - 84, y: VH/2 + 20,  w: 168, h: 38, label: 'N E W  S E S S I O N' },
+  debug: { x: VW/2 - 84, y: VH/2 + 72,  w: 168, h: 38, label: 'D E B U G' },
+};
+
+function hitBtn(mx, my) {
+  for (const [id, b] of Object.entries(BTNS)) {
+    if (mx >= b.x && mx <= b.x+b.w && my >= b.y && my <= b.y+b.h) return id;
+  }
+  return null;
+}
+
+function drawBtn(b, hovered) {
+  ctx.beginPath();
+  ctx.roundRect(b.x, b.y, b.w, b.h, 5);
+  ctx.fillStyle   = hovered ? 'rgba(80,120,220,0.10)' : 'rgba(80,120,220,0.04)';
+  ctx.strokeStyle = hovered ? 'rgba(80,120,220,0.50)' : 'rgba(80,120,220,0.22)';
+  ctx.lineWidth   = 1;
+  ctx.fill(); ctx.stroke();
+  ctx.font      = '11px Courier New';
+  ctx.textAlign = 'center';
+  ctx.fillStyle = hovered ? 'rgba(48,88,210,0.88)' : 'rgba(48,88,210,0.50)';
+  ctx.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 4);
+  ctx.textAlign = 'left';
+}
+
+// ── Draw ──────────────────────────────────────────────────────
+function draw() {
+  ctx.save();
+  ctx.scale(2, 2); // render all game coords at 2× — canvas is 1440×960, logic stays 720×480
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, VW, VH);
+
+  // Bubbles drawn in screen space for all states (parallax uses cam)
+  drawBubbles();
+
+  // ── Loading ─────────────────────────────────────────────────
+  if (gameState === 'loading') {
+    const prog = loadedCount / ALL_FILES.length;
+    const bw = 180;
+    ctx.textAlign = 'center';
+    ctx.font = '11px Courier New';
+    ctx.fillStyle = 'rgba(70,80,130,0.82)';
+    ctx.fillText('Glēo', VW/2, VH/2 - 30);
+    ctx.fillStyle = 'rgba(138,146,188,0.35)';
+    ctx.fillRect(VW/2 - bw/2, VH/2 - 1, bw, 2);
+    ctx.fillStyle = 'rgba(100,130,220,0.50)';
+    ctx.fillRect(VW/2 - bw/2, VH/2 - 1, bw * prog, 2);
+    ctx.fillStyle = 'rgba(138,146,188,0.38)';
+    ctx.fillText(`${loadedCount} / ${ALL_FILES.length}`, VW/2, VH/2 + 20);
+    ctx.textAlign = 'left';
+    ctx.restore(); return;
+  }
+
+  // ── Menu ────────────────────────────────────────────────────
+  if (gameState === 'menu') {
+    ctx.textAlign = 'center';
+    ctx.font = 'bold 28px Courier New';
+    ctx.fillStyle = 'rgba(48,80,200,0.70)';
+    ctx.fillText('Glēo', VW/2, VH/2 - 22);
+    ctx.textAlign = 'left';
+    Object.entries(BTNS).forEach(([id, b], i) =>
+      drawBtn(b, hitBtn(mouse.x, mouse.y) === id || menuSelected === i));
+    ctx.textAlign = 'center';
+    ctx.font = '10px Courier New';
+    ctx.fillStyle = 'rgba(70,80,130,0.82)';
+    ctx.fillText('Put on headphones for the best experience.', VW/2, VH/2 + 130);
+    ctx.textAlign = 'left';
+    ctx.restore(); return;
+  }
+
+  // ── World space (playing / debug / levelclear) ───────────────
+  ctx.save();
+  ctx.translate(-Math.round(cam.x), -Math.round(cam.y));
+
+  // World boundary
+  ctx.strokeStyle = 'rgba(160,168,210,0.18)'; ctx.lineWidth = 2;
+  ctx.strokeRect(0, 0, WORLD_W, WORLD_H);
+
+  // Orbs
+  const isDebug = gameState === 'debug';
+  for (const o of orbs) {
+    const ps = o.type === 'blue' ? Math.sin(o.pulse) * 0.15 + 1 : 1;
+    if (o.type === 'blue') {
+      // Visual pull toward player when in proximity
+      let drawX = o.x, drawY = o.y;
+      if (o.connected) {
+        const od    = dist(player, o);
+        const range = player.r + o.r + 6;
+        const t     = Math.pow(Math.max(0, 1 - od / range), 1.5);
+        drawX = o.x + (player.x - o.x) * t * 0.90;
+        drawY = o.y + (player.y - o.y) * t * 0.90;
+      }
+      const captured = orbCaptures.has(o.soundIdx);
+      const active   = o.connected || captured;
+      glowFlat(drawX, drawY, o.r * ps, o.rgb, active ? 0.55 : 0.2);
+      ctx.beginPath(); ctx.arc(drawX, drawY, o.r * ps, 0, Math.PI * 2);
+      ctx.fillStyle   = o.hsl + (active ? '0.92)' : '0.68)');
+      ctx.strokeStyle = o.hsl + (active ? '0.95)' : '0.55)');
+      ctx.lineWidth = 1; ctx.fill(); ctx.stroke();
+
+      // Debug labels
+      if (isDebug && o.soundIdx >= 0) {
+        ctx.font      = '8px Courier New';
+        ctx.textAlign = 'center';
+        ctx.fillStyle = captured ? 'rgba(42,180,100,0.85)' : 'rgba(80,100,190,0.65)';
+        ctx.fillText(ORB_FILES[o.soundIdx].replace('audio/','').replace('.mp3',''), drawX, drawY + o.r * ps + 11);
+        ctx.textAlign = 'left';
+      }
+    } else {
+      glowAt(o.x, o.y, o.r * ps, '28,18,48', 0.09);
+      ctx.beginPath(); ctx.arc(o.x, o.y, o.r * ps, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(18,12,30,0.9)'; ctx.strokeStyle = 'rgba(58,38,88,0.4)';
+      ctx.lineWidth = 1.2; ctx.fill(); ctx.stroke();
+    }
+  }
+
+  // Player
+  const pr = player.r;
+  glowAt(player.x, player.y, pr, '215,228,255', 0.18);
+  ctx.beginPath();
+  ctx.arc(player.x, player.y, pr + 4 + Math.sin(tick * 0.03) * 1.5, 0, Math.PI * 2);
+  ctx.strokeStyle = 'rgba(200,215,248,0.22)'; ctx.lineWidth = 1; ctx.stroke();
+  ctx.beginPath(); ctx.arc(player.x, player.y, pr, 0, Math.PI * 2);
+  const pg = ctx.createRadialGradient(player.x - pr*0.3, player.y - pr*0.3, pr*0.1, player.x, player.y, pr);
+  pg.addColorStop(0,   'rgba(248,251,255,0.96)');
+  pg.addColorStop(0.5, 'rgba(228,238,255,0.82)');
+  pg.addColorStop(1,   'rgba(205,220,252,0.60)');
+  ctx.fillStyle = pg; ctx.strokeStyle = 'rgba(188,208,245,0.45)'; ctx.lineWidth = 1.5;
+  ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.arc(player.x, player.y, 3, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(200,218,252,0.70)'; ctx.fill();
+
+  // Attraction range ring (visible while space is held)
+  if (keys[' ']) {
+    const t = Math.min(spaceAttractFrames / PUSH_FRAMES, 1);
+    ctx.beginPath();
+    ctx.arc(player.x, player.y, ATTRACT_RANGE, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(180,205,255,${0.07 + t * 0.10})`;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+  }
+
+  // Space hold arc
+  if (spaceTimer > 0) {
+    const prog = spaceTimer / SPACE_FRAMES;
+    ctx.beginPath();
+    ctx.arc(player.x, player.y, pr + 15, -Math.PI/2, -Math.PI/2 + prog * Math.PI * 2);
+    ctx.strokeStyle = prog > 0.75 ? 'rgba(45,210,100,0.82)' : 'rgba(60,140,255,0.72)';
+    ctx.lineWidth = 2.5; ctx.stroke();
+  }
+
+  ctx.restore();
+
+  // ── Screen-space HUD ────────────────────────────────────────
+  const conn = player ? orbs.filter(o => o.connected).length : 0;
+  ctx.font = '10px Courier New';
+
+  if (isDebug) {
+    // Debug HUD
+    ctx.fillStyle = 'rgba(138,146,188,0.7)';
+    ctx.fillText('DEBUG', 14, 22);
+    ctx.fillStyle = 'rgba(138,146,188,0.5)';
+    ctx.fillText('ESC — menu  |  SPACE (3s) — capture', 14, VH - 14);
+    if (conn > 0) {
+      ctx.fillStyle = 'rgba(78,142,255,0.82)';
+      ctx.fillText(`touching  ${conn}`, 14, 36);
+    }
+    if (orbCaptures.size > 0) {
+      ctx.fillStyle = 'rgba(42,180,100,0.75)';
+      ctx.fillText(`captured  ${orbCaptures.size}`, 14, conn > 0 ? 50 : 36);
+    }
+  } else {
+    // Normal HUD (suppressed for tutorial)
+    if (lvlIdx !== 0) {
+      if (orbCaptures.size > 0) {
+        ctx.fillStyle = 'rgba(65,192,118,0.78)';
+        ctx.fillText(`melody  +${orbCaptures.size}`, 14, conn > 0 ? 50 : 36);
+      }
+      if (conn > 0 && spaceTimer < 1) {
+        ctx.fillStyle = 'rgba(150,160,208,0.42)';
+        ctx.fillText('hold  space', 14, VH - 14);
+      }
+    }
+    if (spaceTimer > 0) {
+      const prog = spaceTimer / SPACE_FRAMES, bw = 110;
+      ctx.fillStyle = 'rgba(210,215,235,0.35)';
+      ctx.fillRect(14, VH - 18, bw, 2.5);
+      ctx.fillStyle = prog > 0.75 ? 'rgba(42,198,92,0.88)' : 'rgba(60,130,255,0.78)';
+      ctx.fillRect(14, VH - 18, bw * prog, 2.5);
+    }
+  }
+
+  // Tutorial subtitle text
+  if (lvlIdx === 0 && gameState === 'playing') {
+    ctx.textAlign = 'center';
+    ctx.font = '13px Courier New';
+    const a1 = !tutorialFirstTouch ? 0.42
+             : tutorialTimer < 60  ? 0.42 * (1 - tutorialTimer / 60)
+             : 0;
+    if (a1 > 0.005) {
+      ctx.fillStyle = `rgba(70,80,130,${a1.toFixed(3)})`;
+      ctx.fillText('Use ←↑↓→ or WASD to move', VW / 2, 80);
+    }
+    const a2 = (!tutorialFirstTouch || tutorialTimer < 60) ? 0
+             : tutorialTimer < 120 ? 0.42 * ((tutorialTimer - 60) / 60)
+             : 0.42;
+    if (a2 > 0.005) {
+      ctx.fillStyle = `rgba(70,80,130,${a2.toFixed(3)})`;
+      ctx.fillText('Hold SPACE to attach melody', VW / 2, 80);
+    }
+    ctx.textAlign = 'left';
+  }
+
+  // Per-level hint text (levels 1-3)
+  if (gameState === 'playing' && lvlIdx >= 1) {
+    ctx.textAlign = 'center';
+    ctx.font = '11px Courier New';
+    ctx.fillStyle = 'rgba(70,80,130,0.82)';
+    if (lvlIdx === 1) {
+      ctx.fillText('Hold Space to attract the melody, release to repel it.', VW / 2, 46);
+      ctx.fillStyle = 'rgba(70,80,130,0.20)';
+      ctx.fillText('Collect 2 melody orbs to enter the next chapter.', VW / 2, 62);
+    } else if (lvlIdx === 2) {
+      ctx.fillStyle = 'rgba(70,80,130,0.82)';
+      ctx.fillText('Find the Great Melody Orb.', VW / 2, 46);
+    } else if (lvlIdx === 3) {
+      ctx.fillStyle = 'rgba(70,80,130,0.82)';
+      ctx.fillText('Explore freely and complete the final chapter.', VW / 2, 46);
+    }
+    ctx.textAlign = 'left';
+  }
+
+  // ESC hint (playing)
+  if (gameState === 'playing') {
+    ctx.fillStyle = 'rgba(180,185,210,0.28)';
+    ctx.fillText('ESC', VW - 30, VH - 14);
+  }
+
+  // Level-clear / complete overlay
+  if (gameState === 'levelclear' || gameState === 'complete') {
+    const maxR = Math.hypot(VW / 2, VH / 2) + 2;
+    const cx = VW / 2, cy = VH / 2;
+
+    if (clearTimer <= 120) {
+      if (clearTimer >= 30) {
+        const t2 = Math.min((clearTimer - 30) / 90, 1);
+        ctx.beginPath(); ctx.arc(cx, cy, maxR * (1 - Math.pow(1 - t2, 2)), 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(175,210,252,0.92)'; ctx.fill();
+      }
+      const r1 = 600 * Math.sin(Math.PI * (clearTimer / 120));
+      if (r1 > 0.5) {
+        ctx.beginPath(); ctx.arc(cx, cy, r1, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(205,230,255,0.82)'; ctx.fill();
+      }
+    } else {
+      ctx.beginPath(); ctx.arc(cx, cy, maxR, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(175,210,252,0.95)'; ctx.fill();
+      ctx.textAlign = 'center';
+
+      if (gameState === 'complete') {
+        // ── Piece Completed screen ───────────────────────────
+        ctx.font = 'bold 20px Courier New';
+        ctx.fillStyle = 'rgba(255,255,255,0.95)';
+        ctx.fillText('Piece Completed', cx, cy - 24);
+        if (saveRendering) {
+          const TOTAL_MS = 8 * 2400 * 4;
+          const pct = Math.min((performance.now() - saveStartTime) / TOTAL_MS, 1);
+          const barW = 200, barH = 8, bx = cx - 100, by = cy + 16;
+          ctx.beginPath(); ctx.roundRect(bx, by, barW, barH, 4);
+          ctx.fillStyle = 'rgba(255,255,255,0.18)'; ctx.fill();
+          ctx.beginPath(); ctx.roundRect(bx, by, barW * pct, barH, 4);
+          ctx.fillStyle = 'rgba(255,255,255,0.75)'; ctx.fill();
+          ctx.font = '10px Courier New';
+          ctx.fillStyle = 'rgba(255,255,255,0.55)';
+          ctx.fillText('recording...', cx, cy + 40);
+          canvas.style.cursor = 'default';
+        } else {
+          const btnDef = (x, y, w, h, label) => {
+            const hov = mouse.x >= x && mouse.x <= x+w && mouse.y >= y && mouse.y <= y+h;
+            ctx.beginPath(); ctx.roundRect(x, y, w, h, 5);
+            ctx.fillStyle   = `rgba(255,255,255,${hov ? 0.22 : 0.10})`;
+            ctx.strokeStyle = `rgba(255,255,255,${hov ? 0.85 : 0.45})`;
+            ctx.lineWidth = 1; ctx.fill(); ctx.stroke();
+            ctx.font = '10px Courier New';
+            ctx.fillStyle = `rgba(255,255,255,${hov ? 0.98 : 0.78})`;
+            ctx.fillText(label, x + w/2, y + h/2 + 4);
+            return hov;
+          };
+          const hovS = btnDef(cx - 140, cy + 10, 130, 36, 'S A V E  A U D I O');
+          const hovP = btnDef(cx +  10, cy + 10, 130, 36, 'P L A Y  A G A I N');
+          canvas.style.cursor = (hovS || hovP) ? 'pointer' : 'default';
+        }
+      } else {
+        // ── Segment completed screen ─────────────────────────
+        ctx.font = 'bold 20px Courier New';
+        ctx.fillStyle = 'rgba(255,255,255,0.95)';
+        const segLabel = 'session finished';
+        ctx.fillText(segLabel, cx, cy - 18);
+        const bx = cx - 60, by = cy + 18, bw = 120, bh = 36;
+        const hov = mouse.x >= bx && mouse.x <= bx+bw && mouse.y >= by && mouse.y <= by+bh;
+        ctx.beginPath(); ctx.roundRect(bx, by, bw, bh, 5);
+        ctx.fillStyle   = `rgba(255,255,255,${hov ? 0.22 : 0.10})`;
+        ctx.strokeStyle = `rgba(255,255,255,${hov ? 0.85 : 0.45})`;
+        ctx.lineWidth = 1; ctx.fill(); ctx.stroke();
+        ctx.font = '11px Courier New';
+        ctx.fillStyle = `rgba(255,255,255,${hov ? 0.98 : 0.78})`;
+        ctx.fillText('N E X T', cx, by + bh/2 + 4);
+        canvas.style.cursor = hov ? 'pointer' : 'default';
+      }
+      ctx.textAlign = 'left';
+    }
+  }
+  // Exit overlay — draws on top of any state while clearOutTimer is active
+  if (clearOutTimer >= 0) {
+    const t = clearOutTimer / 60;
+    const r = Math.hypot(VW / 2, VH / 2) * (1 - t * t);
+    if (r > 0) {
+      ctx.beginPath(); ctx.arc(VW / 2, VH / 2, r, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(175,210,252,0.95)'; ctx.fill();
+    }
+  }
+
+  ctx.restore(); // end scale(2,2)
+}
+
+// ── Boot ──────────────────────────────────────────────────────
+function loop() { update(); draw(); requestAnimationFrame(loop); }
+loop();
+</script>
+</body>
+</html>
