@@ -8,7 +8,8 @@
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { background: #f4f4f8; display: flex; align-items: center; justify-content: center;
          min-height: 100vh; font-family: 'Courier New', monospace; }
-  canvas { display: block; border: 1px solid #dde; cursor: default; }
+  canvas { display: block; border: 1px solid #dde; cursor: default;
+           width: min(720px, 100vw - 16px); aspect-ratio: 3 / 2; height: auto; }
 </style>
 </head>
 <body>
@@ -17,58 +18,80 @@
 const canvas = document.getElementById('c');
 const ctx    = canvas.getContext('2d');
 const VW = 720, VH = 480;
-canvas.width = VW * 2; canvas.height = VH * 2; // 2× resolution, all coords stay in 720×480
+// Backing store scaled for crisp rendering; all game coords stay in 720×480
+const RES = Math.max(2, Math.ceil(window.devicePixelRatio || 1));
+canvas.width = VW * RES; canvas.height = VH * RES;
+const DEBUG_ENABLED = new URLSearchParams(location.search).has('debug');
 
 // ── Input ─────────────────────────────────────────────────────
 const keys  = {};
 const mouse = { x: 0, y: 0 };
 
-let menuSelected = 0; // 0 = START, 1 = DEBUG
+let menuSelected = 0; // index into visible menu buttons
 
+// Map a mouse event to 720×480 logical coords regardless of CSS size
+function toLogical(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) * VW / r.width, y: (e.clientY - r.top) * VH / r.height };
+}
+
+function startNewSession() {
+  startAudio(); resetAudioState(); pieceMode = false; initLevel(0);
+}
+
+function activateMenu(id) {
+  if (id === 'start') startNewSession();
+  if (id === 'debug') { startAudio(); resetAudioState(); initDebugLevel(); }
+}
+
+const MOVE_CODES = ['Space','ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Enter'];
 window.addEventListener('keydown', e => {
-  keys[e.key] = true;
-  if ([' ','ArrowLeft','ArrowRight','ArrowUp','ArrowDown','Enter'].includes(e.key)) e.preventDefault();
-  if (e.key === 'Escape') returnToMenu();
-  if (gameState === 'levelclear' && clearTimer > 120 && clearOutTimer < 0) {
-    if ((e.key === ' ' && !spaceLockedOnClear) || e.key === 'Enter') { initLevel(lvlIdx + 1); clearOutTimer = 0; }
+  keys[e.code] = true;
+  if (MOVE_CODES.includes(e.code)) e.preventDefault();
+  if (e.repeat) return;
+  const confirm = (e.code === 'Space' && !spaceLockedOnClear) || e.code === 'Enter';
+  if (e.code === 'Escape') { returnToMenu(); return; }
+  if (gameState === 'levelclear') {
+    if (clearTimer > 120 && clearOutTimer < 0 && confirm) { initLevel(lvlIdx + 1); clearOutTimer = 0; }
+    return;
   }
-  if (gameState === 'complete' && clearTimer > 120 && !saveRendering) {
-    if ((e.key === ' ' && !spaceLockedOnClear) || e.key === 'Enter') playAgainFromComplete();
+  if (gameState === 'complete') {
+    if (clearTimer > 120 && !saveRendering && confirm) playAgainFromComplete();
+    return;
   }
   if (gameState === 'menu') {
-    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
-      menuSelected = menuSelected === 0 ? 1 : 0;
+    const ids = menuButtonIds();
+    if (e.code === 'ArrowUp' || e.code === 'ArrowDown') {
+      menuSelected = (menuSelected + (e.code === 'ArrowUp' ? ids.length - 1 : 1)) % ids.length;
     }
-    if (e.key === ' ' || e.key === 'Enter') {
-      if (menuSelected === 0) { startAudio(); initLevel(0); }
-      else                    { startAudio(); initDebugLevel(); }
-    }
+    if (e.code === 'Space' || e.code === 'Enter') activateMenu(ids[menuSelected]);
   }
 });
 window.addEventListener('keyup', e => {
-  keys[e.key] = false;
-  if (e.key === ' ') spaceLockedOnClear = false;
+  keys[e.code] = false;
+  if (e.code === 'Space') spaceLockedOnClear = false;
 });
+// Clear held keys when the window loses focus so the player doesn't drift
+window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; });
 canvas.addEventListener('mousemove', e => {
-  const r = canvas.getBoundingClientRect();
-  mouse.x = (e.clientX - r.left) / 2;
-  mouse.y = (e.clientY - r.top)  / 2;
-  canvas.style.cursor = (gameState === 'menu' && hitBtn(mouse.x, mouse.y)) ? 'pointer' : 'default';
+  const p = toLogical(e);
+  mouse.x = p.x; mouse.y = p.y;
+  if (gameState === 'menu') {
+    const b = hitBtn(mouse.x, mouse.y);
+    if (b) menuSelected = menuButtonIds().indexOf(b);
+    canvas.style.cursor = b ? 'pointer' : 'default';
+  }
 });
 canvas.addEventListener('click', e => {
-  const r  = canvas.getBoundingClientRect();
-  const mx = (e.clientX - r.left) / 2, my = (e.clientY - r.top) / 2;
-  if (gameState === 'menu') {
-    const b = hitBtn(mx, my);
-    if (b === 'start') { startAudio(); resetAudioState(); pieceMode = false; initLevel(0); }
-    if (b === 'debug') { startAudio(); initDebugLevel(); }
-  }
+  const { x: mx, y: my } = toLogical(e);
+  if (gameState === 'menu') { activateMenu(hitBtn(mx, my)); return; }
   if (gameState === 'levelclear' && clearTimer > 120 && clearOutTimer < 0) {
     const bx = VW/2 - 60, by = VH/2 + 18, bw = 120, bh = 36;
     if (mx >= bx && mx <= bx+bw && my >= by && my <= by+bh) {
       initLevel(lvlIdx + 1);
       clearOutTimer = 0;
     }
+    return;
   }
   if (gameState === 'complete' && clearTimer > 120 && !saveRendering) {
     const cx = VW/2, cy = VH/2;
@@ -86,7 +109,7 @@ const PLAYER_R       = 54;
 const PLAYER_MAX_SPD = 3.0;
 const PLAYER_ACCEL   = 0.018;
 const PLAYER_FRIC    = 0.982;
-const SPACE_FRAMES   = 240;     // 4 s @ 60 fps
+const SPACE_FRAMES   = 240;     // 4 s @ 60 fps (simulation runs at fixed 60 Hz)
 const ATTRACT_RANGE  = PLAYER_R * 6;  // 3× player diameter
 const ATTRACT_FORCE  = 0.024;  // reduced 70%
 const ATTRACT_MAX_V  = 2.0;
@@ -94,6 +117,9 @@ const PUSH_FRAMES    = 15;            // 0.25 s equivalent
 const BASE_GAIN      = 0.80;
 const PREVIEW_GAIN   = 0.8;
 const CAPTURE_GAIN   = 0.8;
+const SAVE_SECTION_MS = 8 * 2400;          // 8 bars per export section
+const SAVE_TOTAL_MS   = SAVE_SECTION_MS * 4;
+const LOAD_TIMEOUT_MS = 8000;              // don't stall on browsers that won't preload
 
 // 4 levels: 0=tutorial  1=chapter1  2=chapter2  3=final
 
@@ -130,6 +156,8 @@ ALL_FILES.forEach(name => {
     a.addEventListener('error',          bump, { once: true }); // count errors so we don't stall
   }
 });
+
+const loadStartTime = performance.now();
 
 // Per-orb-sound state (indexed by ORB_FILES index 0–13)
 const previewCounts = new Array(ORB_FILES.length).fill(0); // orbs currently in proximity
@@ -196,8 +224,8 @@ async function saveAudio() {
   saveRendering = true;
   saveStartTime = performance.now();
 
-  const SECTION_MS = 8 * 2400;
-  const TOTAL_MS   = SECTION_MS * 4;
+  const SECTION_MS = SAVE_SECTION_MS;
+  const TOTAL_MS   = SAVE_TOTAL_MS;
   const lvl1Orbs   = [...level1OrbCaptures].filter(i => i >= 0);
   const lvl3Orbs   = [...orbCaptures].filter(i => i >= 0 && !level1OrbCaptures.has(i));
 
@@ -234,22 +262,27 @@ async function saveAudio() {
     const rec = new MediaRecorder(recDest.stream, mime ? { mimeType: mime } : {});
     rec.ondataavailable = e => { if (e.data.size > 0) chunks.push(e.data); };
     rec.onstop = () => {
+      saveTimers.forEach(clearTimeout); saveTimers = []; saveRecorder = null;
+      ALL_FILES.forEach(n => { audioEls[n].volume = savedVols[n]; });
+      recAc.close();
+      saveRendering = false;
+      if (saveAbort) return;   // cancelled — discard
       const blob = new Blob(chunks, { type: mime || 'audio/webm' });
       const url  = URL.createObjectURL(blob);
       const a    = Object.assign(document.createElement('a'), { href: url, download: 'gleo.webm' });
       document.body.appendChild(a); a.click(); document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(url), 2000);
-      ALL_FILES.forEach(n => { audioEls[n].volume = savedVols[n]; });
-      recAc.close();
-      saveRendering = false;
     };
 
     applySection(sections[0]);
     rec.start(250);
-    setTimeout(() => applySection(sections[1]), SECTION_MS);
-    setTimeout(() => applySection(sections[2]), SECTION_MS * 2);
-    setTimeout(() => applySection(sections[3]), SECTION_MS * 3);
-    setTimeout(() => rec.stop(),                TOTAL_MS);
+    saveTimers = [
+      setTimeout(() => applySection(sections[1]), SECTION_MS),
+      setTimeout(() => applySection(sections[2]), SECTION_MS * 2),
+      setTimeout(() => applySection(sections[3]), SECTION_MS * 3),
+      setTimeout(() => rec.stop(),                TOTAL_MS),
+    ];
+    saveRecorder = rec; saveAbort = false;
 
   } catch(e) {
     ALL_FILES.forEach(n => { audioEls[n].volume = savedVols[n]; });
@@ -257,6 +290,12 @@ async function saveAudio() {
     alert('Recording failed: ' + e.message);
     saveRendering = false;
   }
+}
+
+function cancelSave() {
+  if (!saveRendering || !saveRecorder) return;
+  saveAbort = true;
+  saveRecorder.stop();
 }
 
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
@@ -270,7 +309,7 @@ let spaceTimer       = 0;
 let spaceAttractFrames = 0;
 let prevSpaceHeld    = false;
 let levelVolScale = 1.0;  // per-level melody volume multiplier
-let gameState     = 'loading'; // 'loading'|'menu'|'playing'|'levelclear'|'debug'
+let gameState     = 'loading'; // 'loading'|'menu'|'playing'|'levelclear'|'complete'|'debug'
 let clearTimer    = 0;
 let clearOutTimer = -1;  // -1 = inactive; ≥0 = exit animation running
 let tutorialFirstTouch  = false;
@@ -281,6 +320,9 @@ let greatMelodyCaptured = false;
 let pieceMode           = false;
 let saveRendering       = false;
 let saveStartTime       = 0;
+let saveTimers          = [];
+let saveRecorder        = null;
+let saveAbort           = false;
 let tick          = 0;
 
 function rnd(a, b) { return a + Math.random() * (b - a); }
@@ -477,7 +519,8 @@ function captureNoiseOrb(orb) {
 
 function returnToMenu() {
   if (gameState === 'playing' || gameState === 'debug' || gameState === 'levelclear' || gameState === 'complete') {
-    stopAllPreviews();
+    cancelSave();
+    resetAudioState();
     baseTargets[0] = BASE_GAIN;
     gameState = 'menu';
   }
@@ -602,10 +645,10 @@ function initDebugLevel() {
 function captureAndEndLevel() {
   for (const o of orbs) {
     if (!o.connected) continue;
-    if (o.type === 'blue' && !o.isTutorial && !o.isGreatMelody) orbCaptures.add(o.soundIdx);
+    if (o.type === 'blue' && !o.isTutorial && !o.isGreatMelody) { orbCaptures.add(o.soundIdx); o.captured = true; }
     if (o.type === 'black') captureNoiseOrb(o);
   }
-  spaceLockedOnClear = !!keys[' '];
+  spaceLockedOnClear = !!keys['Space'];
   gameState  = lvlIdx >= 3 ? 'complete' : 'levelclear';
   clearTimer = 0;
 }
@@ -658,7 +701,7 @@ function update() {
   updateBubbles();
 
   if (gameState === 'loading') {
-    if (loadedCount >= ALL_FILES.length) gameState = 'menu';
+    if (loadedCount >= ALL_FILES.length || performance.now() - loadStartTime > LOAD_TIMEOUT_MS) gameState = 'menu';
     return;
   }
   if (gameState === 'menu') return;
@@ -675,10 +718,10 @@ function update() {
 
   // Player movement
   let ax = 0, ay = 0;
-  if (keys['ArrowLeft']  || keys['a']) ax -= 1;
-  if (keys['ArrowRight'] || keys['d']) ax += 1;
-  if (keys['ArrowUp']    || keys['w']) ay -= 1;
-  if (keys['ArrowDown']  || keys['s']) ay += 1;
+  if (keys['ArrowLeft']  || keys['KeyA']) ax -= 1;
+  if (keys['ArrowRight'] || keys['KeyD']) ax += 1;
+  if (keys['ArrowUp']    || keys['KeyW']) ay -= 1;
+  if (keys['ArrowDown']  || keys['KeyS']) ay += 1;
   const al = Math.hypot(ax, ay);
   if (al > 0) { ax /= al; ay /= al; }
   const pspd0    = Math.hypot(player.vx, player.vy);
@@ -769,8 +812,8 @@ function update() {
   }
   if (tutorialFirstTouch) tutorialTimer++;
 
-  // Space: attract orbs + (hold 3 s while connected → capture)
-  const spaceHeld = !!keys[' '];
+  // Space: attract orbs + (hold 4 s while connected → capture)
+  const spaceHeld = !!keys['Space'];
 
   if (spaceHeld) {
     spaceAttractFrames++;
@@ -806,15 +849,15 @@ function update() {
           // Chapter 1: capture ALL currently connected blue orbs at once (≥2 guaranteed)
           for (const o of orbs) {
             if (!o.connected || o.type !== 'blue') continue;
-            orbCaptures.add(o.soundIdx);
+            orbCaptures.add(o.soundIdx); o.captured = true;
           }
           level1OrbCaptures = new Set(orbCaptures);
-          spaceLockedOnClear = !!keys[' '];
+          spaceLockedOnClear = !!keys['Space'];
           gameState = 'levelclear'; clearTimer = 0;
         } else if (lvlIdx === 2) {
           greatMelodyCaptured = true;
           baseTargets[1] = BASE_GAIN;
-          spaceLockedOnClear = !!keys[' '];
+          spaceLockedOnClear = !!keys['Space'];
           gameState = 'levelclear'; clearTimer = 0;
         } else {
           captureAndEndLevel();
@@ -870,8 +913,13 @@ const BTNS = {
   debug: { x: VW/2 - 84, y: VH/2 + 72,  w: 168, h: 38, label: 'D E B U G' },
 };
 
+function menuButtonIds() {
+  return DEBUG_ENABLED ? ['start', 'debug'] : ['start'];
+}
+
 function hitBtn(mx, my) {
-  for (const [id, b] of Object.entries(BTNS)) {
+  for (const id of menuButtonIds()) {
+    const b = BTNS[id];
     if (mx >= b.x && mx <= b.x+b.w && my >= b.y && my <= b.y+b.h) return id;
   }
   return null;
@@ -894,7 +942,7 @@ function drawBtn(b, hovered) {
 // ── Draw ──────────────────────────────────────────────────────
 function draw() {
   ctx.save();
-  ctx.scale(2, 2); // render all game coords at 2× — canvas is 1440×960, logic stays 720×480
+  ctx.scale(RES, RES); // logic stays 720×480
   ctx.fillStyle = '#ffffff';
   ctx.fillRect(0, 0, VW, VH);
 
@@ -926,12 +974,11 @@ function draw() {
     ctx.fillStyle = 'rgba(48,80,200,0.70)';
     ctx.fillText('Glēo', VW/2, VH/2 - 22);
     ctx.textAlign = 'left';
-    Object.entries(BTNS).forEach(([id, b], i) =>
-      drawBtn(b, hitBtn(mouse.x, mouse.y) === id || menuSelected === i));
+    menuButtonIds().forEach((id, i) => drawBtn(BTNS[id], menuSelected === i));
     ctx.textAlign = 'center';
     ctx.font = '10px Courier New';
     ctx.fillStyle = 'rgba(70,80,130,0.82)';
-    ctx.fillText('Put on headphones for the best experience.', VW/2, VH/2 + 130);
+    ctx.fillText('Put on headphones for the best experience.', VW/2, VH/2 + (DEBUG_ENABLED ? 130 : 90));
     ctx.textAlign = 'left';
     ctx.restore(); return;
   }
@@ -946,7 +993,11 @@ function draw() {
 
   // Orbs
   const isDebug = gameState === 'debug';
+  const viewL = cam.x - 120, viewR = cam.x + VW + 120;
+  const viewT = cam.y - 120, viewB = cam.y + VH + 120;
   for (const o of orbs) {
+    if (o.x + o.r * 2.4 < viewL || o.x - o.r * 2.4 > viewR ||
+        o.y + o.r * 2.4 < viewT || o.y - o.r * 2.4 > viewB) continue;
     const ps = o.type === 'blue' ? Math.sin(o.pulse) * 0.15 + 1 : 1;
     if (o.type === 'blue') {
       // Visual pull toward player when in proximity
@@ -958,7 +1009,7 @@ function draw() {
         drawX = o.x + (player.x - o.x) * t * 0.90;
         drawY = o.y + (player.y - o.y) * t * 0.90;
       }
-      const captured = orbCaptures.has(o.soundIdx);
+      const captured = o.captured || (isDebug && orbCaptures.has(o.soundIdx));
       const active   = o.connected || captured;
       glowFlat(drawX, drawY, o.r * ps, o.rgb, active ? 0.55 : 0.2);
       ctx.beginPath(); ctx.arc(drawX, drawY, o.r * ps, 0, Math.PI * 2);
@@ -999,7 +1050,7 @@ function draw() {
   ctx.fillStyle = 'rgba(200,218,252,0.70)'; ctx.fill();
 
   // Attraction range ring (visible while space is held)
-  if (keys[' ']) {
+  if (keys['Space']) {
     const t = Math.min(spaceAttractFrames / PUSH_FRAMES, 1);
     ctx.beginPath();
     ctx.arc(player.x, player.y, ATTRACT_RANGE, 0, Math.PI * 2);
@@ -1028,7 +1079,7 @@ function draw() {
     ctx.fillStyle = 'rgba(138,146,188,0.7)';
     ctx.fillText('DEBUG', 14, 22);
     ctx.fillStyle = 'rgba(138,146,188,0.5)';
-    ctx.fillText('ESC — menu  |  SPACE (3s) — capture', 14, VH - 14);
+    ctx.fillText('ESC — menu  |  SPACE (4s) — capture', 14, VH - 14);
     if (conn > 0) {
       ctx.fillStyle = 'rgba(78,142,255,0.82)';
       ctx.fillText(`touching  ${conn}`, 14, 36);
@@ -1131,8 +1182,7 @@ function draw() {
         ctx.fillStyle = 'rgba(255,255,255,0.95)';
         ctx.fillText('Piece Completed', cx, cy - 24);
         if (saveRendering) {
-          const TOTAL_MS = 8 * 2400 * 4;
-          const pct = Math.min((performance.now() - saveStartTime) / TOTAL_MS, 1);
+          const pct = Math.min((performance.now() - saveStartTime) / SAVE_TOTAL_MS, 1);
           const barW = 200, barH = 8, bx = cx - 100, by = cy + 16;
           ctx.beginPath(); ctx.roundRect(bx, by, barW, barH, 4);
           ctx.fillStyle = 'rgba(255,255,255,0.18)'; ctx.fill();
@@ -1188,12 +1238,21 @@ function draw() {
     }
   }
 
-  ctx.restore(); // end scale(2,2)
+  ctx.restore(); // end scale
 }
 
 // ── Boot ──────────────────────────────────────────────────────
-function loop() { update(); draw(); requestAnimationFrame(loop); }
-loop();
+// Fixed 60 Hz simulation so speed doesn't depend on monitor refresh rate
+const STEP_MS = 1000 / 60;
+let lastTime = performance.now(), accum = 0;
+function loop(now) {
+  accum += Math.min(now - lastTime, 250); // clamp after tab switches
+  lastTime = now;
+  while (accum >= STEP_MS) { update(); accum -= STEP_MS; }
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
 </script>
 </body>
 </html>
