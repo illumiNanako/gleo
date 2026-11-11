@@ -109,7 +109,7 @@ const PLAYER_R       = 54;
 const PLAYER_MAX_SPD = 3.0;
 const PLAYER_ACCEL   = 0.018;
 const PLAYER_FRIC    = 0.982;
-const SPACE_FRAMES   = 240;     // 4 s @ 60 fps (simulation runs at fixed 60 Hz)
+const SPACE_FRAMES   = 240;     // 240 sim steps ≈ 2.7 s at GAME_SPEED 1.5
 const ATTRACT_RANGE  = PLAYER_R * 6;  // 3× player diameter
 const ATTRACT_FORCE  = 0.024;  // reduced 70%
 const ATTRACT_MAX_V  = 2.0;
@@ -812,7 +812,7 @@ function update() {
   }
   if (tutorialFirstTouch) tutorialTimer++;
 
-  // Space: attract orbs + (hold 4 s while connected → capture)
+  // Space: attract orbs + (hold SPACE_FRAMES steps while connected → capture)
   const spaceHeld = !!keys['Space'];
 
   if (spaceHeld) {
@@ -1079,7 +1079,7 @@ function draw() {
     ctx.fillStyle = 'rgba(138,146,188,0.7)';
     ctx.fillText('DEBUG', 14, 22);
     ctx.fillStyle = 'rgba(138,146,188,0.5)';
-    ctx.fillText('ESC — menu  |  SPACE (4s) — capture', 14, VH - 14);
+    ctx.fillText('ESC — menu  |  SPACE (hold) — capture', 14, VH - 14);
     if (conn > 0) {
       ctx.fillStyle = 'rgba(78,142,255,0.82)';
       ctx.fillText(`touching  ${conn}`, 14, 36);
@@ -1242,8 +1242,10 @@ function draw() {
 }
 
 // ── Boot ──────────────────────────────────────────────────────
-// Fixed 60 Hz simulation so speed doesn't depend on monitor refresh rate
-const STEP_MS = 1000 / 60;
+// Fixed-rate simulation so speed doesn't depend on monitor refresh rate.
+// GAME_SPEED scales everything (movement, timers, fades) uniformly.
+const GAME_SPEED = 1.5;
+const STEP_MS = 1000 / (60 * GAME_SPEED);
 let lastTime = performance.now(), accum = 0;
 function loop(now) {
   accum += Math.min(now - lastTime, 250); // clamp after tab switches
