@@ -106,17 +106,18 @@ canvas.addEventListener('click', e => {
 
 // ── Constants ─────────────────────────────────────────────────
 const PLAYER_R       = 54;
-const PLAYER_MAX_SPD = 3.0;
-const PLAYER_ACCEL   = 0.018;
+const PLAYER_MAX_SPD = 4.5;     // ×1.5
+const PLAYER_ACCEL   = 0.027;   // ×1.5
 const PLAYER_FRIC    = 0.982;
 const SPACE_FRAMES   = 240;     // 240 sim steps ≈ 2.7 s at GAME_SPEED 1.5
 const ATTRACT_RANGE  = PLAYER_R * 6;  // 3× player diameter
-const ATTRACT_FORCE  = 0.024;  // reduced 70%
+const ATTRACT_FORCE  = 0.036;  // ×1.5 (also drives release push)
 const ATTRACT_MAX_V  = 2.0;
 const PUSH_FRAMES    = 15;            // 0.25 s equivalent
 const BASE_GAIN      = 0.80;
-const PREVIEW_GAIN   = 0.8;
-const CAPTURE_GAIN   = 0.8;
+const PREVIEW_GAIN   = 0.8;   // noise-orb preview level
+const CAPTURE_GAIN   = 0.8;   // noise-orb capture level
+const ORB_GAIN       = 0.4;   // melody-orb level (half of base so the main melody stands out)
 const SAVE_SECTION_MS = 8 * 2400;          // 8 bars per export section
 const SAVE_TOTAL_MS   = SAVE_SECTION_MS * 4;
 const LOAD_TIMEOUT_MS = 8000;              // don't stall on browsers that won't preload
@@ -186,8 +187,8 @@ function updateVolumes() {
     a.volume = clamp(a.volume + (baseTargets[i] - a.volume) * LERP_SLOW, 0, 1);
   }
   for (let i = 0; i < ORB_FILES.length; i++) {
-    const target = orbCaptures.has(i) ? CAPTURE_GAIN * levelVolScale
-                 : previewCounts[i] > 0 ? PREVIEW_GAIN * levelVolScale
+    const target = orbCaptures.has(i) ? ORB_GAIN * levelVolScale
+                 : previewCounts[i] > 0 ? ORB_GAIN * levelVolScale
                  : 0;
     const a = audioEls[ORB_FILES[i]];
     a.volume = clamp(a.volume + (target - a.volume) * LERP_FAST, 0, 1);
@@ -241,7 +242,7 @@ async function saveAudio() {
 
   const applySection = sec => {
     BASE_FILES.forEach((n, i) => { audioEls[n].volume = sec.bases.has(i) ? BASE_GAIN    : 0; });
-    ORB_FILES.forEach( (n, i) => { audioEls[n].volume = sec.orbs.has(i)  ? CAPTURE_GAIN : 0; });
+    ORB_FILES.forEach( (n, i) => { audioEls[n].volume = sec.orbs.has(i)  ? ORB_GAIN : 0; });
   };
 
   let recAc;
